@@ -44,14 +44,19 @@ app.get('/test', (req, res) => {
 // ── Rotas autenticadas ─────────────────────────────────
 try {
   const auth = require('./middleware/auth');
+  console.log('✅ auth carregado');
   app.use('/user',         auth, require('./routes/user'));
+  console.log('✅ user carregado');
   app.use('/payment',      auth, require('./routes/payment'));
+  console.log('✅ payment carregado');
   app.use('/translate',    auth, require('./routes/translate'));
+  console.log('✅ translate carregado');
   app.use('/subscription', auth, require('./routes/payment'));
   app.use('/ranking',           require('./routes/ranking'));
-  console.log('✅ Rotas carregadas com sucesso');
+  console.log('✅ todas as rotas carregadas');
 } catch(e) {
   console.error('❌ Erro ao carregar rotas:', e.message);
+  console.error('Stack:', e.stack);
 }
 
 // ── Cron Jobs ──────────────────────────────────────────

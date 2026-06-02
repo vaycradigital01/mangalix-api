@@ -1,5 +1,4 @@
-const proxyRouter = require('./src/routes/proxy');
-app.use('/proxy/mangadex', proxyRouter);
+
 require('dotenv').config();
 const express   = require('express');
 const cors      = require('cors');

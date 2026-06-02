@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const express   = require('express');
 const cors      = require('cors');
@@ -8,7 +7,6 @@ const cron      = require('node-cron');
 
 const app = express();
 app.set('trust proxy', 1);
-
 app.use(helmet());
 app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(',') || '*' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
@@ -16,6 +14,9 @@ app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
 // Webhooks ANTES do json parser
 try { app.use('/webhook/stripe',      require('./routes/webhook-stripe'));      } catch(e) { console.error('webhook-stripe:', e.message); }
 try { app.use('/webhook/infinitepay', require('./routes/webhook-infinitepay')); } catch(e) { console.error('webhook-infinitepay:', e.message); }
+
+// Proxy MangaDex ANTES do json parser
+try { app.use('/proxy/mangadex', require('./routes/proxy')); } catch(e) { console.error('proxy:', e.message); }
 
 app.use(express.json({ limit: '10mb' }));
 

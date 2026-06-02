@@ -1,96 +1,105 @@
 /**
- * MANGALIX — MangaDex Proxy Routes
+ * MANGALIX — MangaDex Proxy
+ * Salva em: src/routes/proxy.js  (no mangalix-api)
  *
- * Cole em src/routes/proxy.js no mangalix-api.
- * No server.js, adicione ANTES das outras rotas:
- *
- *   const proxyRouter = require('./src/routes/proxy');
- *   app.use('/proxy/mangadex', proxyRouter);
+ * No server.js, ANTES do express.json():
+ *   app.use('/proxy/mangadex', require('./src/routes/proxy'));
  */
 
-const express = require('express');
 const axios = require('axios');
 
-const router = express.Router();
+// ─── Cache ────────────────────────────────────────────────────────────────────
 
-const MDX_API = 'https://api.mangadex.org';
-const MDX_UPLOADS = 'https://uploads.mangadex.org';
-const HEADERS = {
-  'User-Agent': 'Mangalix/1.0 (api.mangalix.com.br)',
-  Accept: 'application/json',
-};
-
-// ─── In-memory cache ──────────────────────────────────────────────────────────
-
-const cache = new Map();
-const CACHE_TTL = 1000 * 60 * 60; // 1 hora
+var cache = new Map();
+var CACHE_TTL = 60 * 60 * 1000; // 1 hora
 
 function cacheSet(key, data) {
   cache.set(key, data);
-  setTimeout(() => cache.delete(key), CACHE_TTL);
+  setTimeout(function () { cache.delete(key); }, CACHE_TTL);
 }
 
-// ─── Rate limiter ─────────────────────────────────────────────────────────────
-// Garante no mínimo 500 ms entre requisições upstream ao MangaDex.
-// lastRequestTime é compartilhado entre todas as rotas deste módulo.
+// ─── Rate limiter + retry ─────────────────────────────────────────────────────
+// Garante 1000ms entre requisições upstream. Retenta 1x após 5s no 429.
 
-let lastRequestTime = 0;
+var lastRequestTime = 0;
+
+function sleep(ms) {
+  return new Promise(function (r) { setTimeout(r, ms); });
+}
+
+function doGet(url) {
+  return axios.get(url, {
+    headers: {
+      'User-Agent': 'Mangalix/1.0 (api.mangalix.com.br)',
+      'Accept': 'application/json',
+    },
+    timeout: 20000,
+  });
+}
 
 async function mdxGet(url) {
-  const elapsed = Date.now() - lastRequestTime;
-  if (elapsed < 500) {
-    await new Promise((r) => setTimeout(r, 500 - elapsed));
-  }
+  var elapsed = Date.now() - lastRequestTime;
+  if (elapsed < 1000) await sleep(1000 - elapsed);
   lastRequestTime = Date.now();
-  return axios.get(url, { headers: HEADERS, timeout: 20_000 });
+
+  try {
+    return await doGet(url);
+  } catch (err) {
+    var status = err.response && err.response.status;
+    if (status === 429) {
+      console.warn('[PROXY] 429 from MangaDex — waiting 5s before retry');
+      await sleep(5000);
+      lastRequestTime = Date.now();
+      return doGet(url); // uma segunda tentativa
+    }
+    throw err;
+  }
 }
 
-// ─── Cover image proxy ────────────────────────────────────────────────────────
-// DEVE vir ANTES do wildcard abaixo — Express avalia rotas em ordem.
+// ─── Middleware exportado diretamente ─────────────────────────────────────────
 
-router.get('/cover/:mangaId/:fileName', async (req, res) => {
-  const { mangaId, fileName } = req.params;
-  const url = `${MDX_UPLOADS}/covers/${mangaId}/${fileName}`;
-  try {
-    const upstream = await axios.get(url, {
-      headers: { 'User-Agent': HEADERS['User-Agent'], Accept: 'image/*' },
-      responseType: 'stream',
-      timeout: 15_000,
-    });
-    res.set('Content-Type', upstream.headers['content-type'] ?? 'image/jpeg');
-    res.set('Cache-Control', 'public, max-age=86400');
-    upstream.data.pipe(res);
-  } catch (err) {
-    const status = err.response?.status ?? 502;
-    console.error(`[PROXY] cover ${mangaId}/${fileName} → ${status}`);
-    res.status(status).json({ error: 'cover proxy error', status });
+module.exports = async function proxyMangaDex(req, res) {
+  var path = req.url; // inclui query string, ex: /manga?title=One+Piece
+
+  // ── Cover image ──────────────────────────────────────────────────────────
+  var coverMatch = path.match(/^\/cover\/([^/]+)\/([^?]+)/);
+  if (coverMatch) {
+    var coverUrl = 'https://uploads.mangadex.org/covers/' + coverMatch[1] + '/' + coverMatch[2];
+    try {
+      var img = await axios.get(coverUrl, {
+        headers: {
+          'User-Agent': 'Mangalix/1.0 (api.mangalix.com.br)',
+          'Accept': 'image/*',
+        },
+        responseType: 'stream',
+        timeout: 15000,
+      });
+      res.set('Content-Type', img.headers['content-type'] || 'image/jpeg');
+      res.set('Cache-Control', 'public, max-age=86400');
+      img.data.pipe(res);
+    } catch (err) {
+      var s = (err.response && err.response.status) || 502;
+      console.error('[PROXY] cover ' + coverMatch[1] + ' → ' + s);
+      res.status(s).json({ error: 'cover proxy error', status: s });
+    }
+    return;
   }
-});
 
-// ─── Generic MangaDex API proxy ───────────────────────────────────────────────
-// Usa req.url (não req.query) para preservar a query string raw e evitar
-// re-serialização incorreta de params como links[al]= e includes[]=.
-
-router.get('*', async (req, res) => {
-  // req.url dentro do router = path + query string relativos ao mount point
-  const cacheKey = req.url;
-
+  // ── MangaDex API ─────────────────────────────────────────────────────────
+  var cacheKey = path;
   if (cache.has(cacheKey)) {
     return res.json(cache.get(cacheKey));
   }
 
-  const target = `${MDX_API}${req.url}`;
-
+  var target = 'https://api.mangadex.org' + path;
   try {
-    const upstream = await mdxGet(target);
+    var upstream = await mdxGet(target);
     cacheSet(cacheKey, upstream.data);
     res.json(upstream.data);
   } catch (err) {
-    const status = err.response?.status ?? 502;
-    const body = err.response?.data ?? { error: 'MangaDex proxy error' };
-    console.error(`[PROXY] ${req.path} → ${status}`);
+    var status = (err.response && err.response.status) || 502;
+    var body = (err.response && err.response.data) || { error: 'MangaDex proxy error' };
+    console.error('[PROXY] ' + path.split('?')[0] + ' → ' + status);
     res.status(status).json(body);
   }
-});
-
-module.exports = router;
+};

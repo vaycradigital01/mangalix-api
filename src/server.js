@@ -16,9 +16,9 @@ try { app.use('/webhook/stripe',      require('./routes/webhook-stripe'));      
 try { app.use('/webhook/infinitepay', require('./routes/webhook-infinitepay')); } catch(e) { console.error('webhook-infinitepay:', e.message); }
 
 // Proxy MangaDex ANTES do json parser
-try { app.use('/proxy/mangadex', require('./routes/proxy')); } catch(e) { console.error('proxy:', e.message); }
-
-app.use(express.json({ limit: '10mb' }));
+const proxyRouter = require('./src/routes/proxy');
+app.use('/proxy/mangadex', proxyRouter);
+console.log('✅ proxy mangadex carregado');
 
 // ── Rotas públicas ─────────────────────────────────────
 app.get('/health', (req, res) => {

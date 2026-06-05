@@ -1,14 +1,9 @@
 /**
  * MANGALIX — MangaDex Proxy
- * Salva em: src/routes/proxy.js  (no mangalix-api)
- *
- * No server.js, ANTES do express.json():
- *   app.use('/proxy/mangadex', require('./src/routes/proxy'));
+ * src/routes/proxy.js (mangalix-api)
  */
 
 const axios = require('axios');
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function sleep(ms) {
   return new Promise(function (r) { setTimeout(r, ms); });
@@ -24,63 +19,56 @@ function doGet(url) {
   });
 }
 
-// ─── Duas filas independentes de rate limiting ────────────────────────────────
-// Capas: 1500ms — lento, não bloqueia a fila de API
-// API (manga, chapters, search): 500ms — rápido, prioritário
+// ─── Cache agressivo ──────────────────────────────────────────────────────────
+var cache = new Map();
+var staleCache = new Map(); // cache antigo para stale-while-revalidate
 
-var lastCoverRequest = 0;
-var lastApiRequest = 0;
+var TTL = {
+  search:   24 * 60 * 60 * 1000, // 24h — títulos não mudam
+  chapters:  2 * 60 * 60 * 1000, // 2h  — capítulos
+  manga:     6 * 60 * 60 * 1000, // 6h  — info do manga
+  default:   1 * 60 * 60 * 1000, // 1h  — resto
+};
 
-async function mdxGetCover(url) {
-  var elapsed = Date.now() - lastCoverRequest;
-  if (elapsed < 1500) await sleep(1500 - elapsed);
-  lastCoverRequest = Date.now();
-  return doGet(url);
+function getTTL(path) {
+  if (path.indexOf('/feed') !== -1) return TTL.chapters;
+  if (path.indexOf('/manga?') !== -1 || path.indexOf('/manga/') !== -1) return TTL.manga;
+  if (path.indexOf('title=') !== -1) return TTL.search;
+  return TTL.default;
 }
 
-async function mdxGetApi(url) {
-  var elapsed = Date.now() - lastApiRequest;
-  if (elapsed < 500) await sleep(500 - elapsed);
-  lastApiRequest = Date.now();
+function cacheSet(key, data) {
+  var ttl = getTTL(key);
+  cache.set(key, data);
+  staleCache.set(key, data); // mantém para fallback
+  setTimeout(function () { cache.delete(key); }, ttl);
+}
 
+// ─── GET com retry e stale fallback ──────────────────────────────────────────
+async function mdxGet(url, path) {
   try {
-    return await doGet(url);
+    var res = await doGet(url);
+    return res;
   } catch (err) {
     var status = err.response && err.response.status;
     if (status === 429) {
-      console.warn('[PROXY] 429 from MangaDex — waiting 5s before retry');
+      // Tenta uma vez após 5s
+      console.warn('[PROXY] 429 — waiting 5s before retry:', path.split('?')[0]);
       await sleep(5000);
-      lastApiRequest = Date.now();
-      return doGet(url);
+      try {
+        return await doGet(url);
+      } catch (err2) {
+        // Se ainda 429, lança para usar stale cache
+        throw err2;
+      }
     }
     throw err;
   }
 }
 
-// ─── Cache ────────────────────────────────────────────────────────────────────
-// Cache geral (search, manga info): 1 hora
-// Cache de capítulos (/feed): 30 minutos
-
-var cache = new Map();
-var chaptersCache = new Map();
-
-var CACHE_TTL          = 60 * 60 * 1000;      // 1 hora
-var CHAPTERS_CACHE_TTL = 30 * 60 * 1000;      // 30 minutos
-
-function cacheSet(key, data) {
-  cache.set(key, data);
-  setTimeout(function () { cache.delete(key); }, CACHE_TTL);
-}
-
-function chaptersCacheSet(key, data) {
-  chaptersCache.set(key, data);
-  setTimeout(function () { chaptersCache.delete(key); }, CHAPTERS_CACHE_TTL);
-}
-
 // ─── Middleware ───────────────────────────────────────────────────────────────
-
 module.exports = async function proxyMangaDex(req, res) {
-  var path = req.url; // inclui query string
+  var path = req.url;
 
   // ── Cover image (/cover/:mangaId/:fileName) ──────────────────────────────
   var coverMatch = path.match(/^\/cover\/([^/]+)\/([^?]+)/);
@@ -100,44 +88,33 @@ module.exports = async function proxyMangaDex(req, res) {
       img.data.pipe(res);
     } catch (err) {
       var s = (err.response && err.response.status) || 502;
-      console.error('[PROXY] cover ' + coverMatch[1] + ' → ' + s);
       res.status(s).json({ error: 'cover proxy error', status: s });
     }
     return;
   }
 
-  // ── Chapter feed (/manga/:id/feed*) — cache 30 min, fila API ────────────
-  var isFeed = path.indexOf('/feed') !== -1;
-  if (isFeed) {
-    var chapKey = path;
-    if (chaptersCache.has(chapKey)) {
-      return res.json(chaptersCache.get(chapKey));
-    }
-    var feedTarget = 'https://api.mangadex.org' + path;
-    try {
-      var feedUpstream = await mdxGetApi(feedTarget);
-      chaptersCacheSet(chapKey, feedUpstream.data);
-      return res.json(feedUpstream.data);
-    } catch (err) {
-      var fs = (err.response && err.response.status) || 502;
-      var fb = (err.response && err.response.data) || { error: 'MangaDex proxy error' };
-      console.error('[PROXY] feed ' + path.split('?')[0] + ' → ' + fs);
-      return res.status(fs).json(fb);
-    }
-  }
-
-  // ── Generic MangaDex API — cache 1h, fila API ────────────────────────────
+  // ── MangaDex API — cache agressivo + stale fallback ──────────────────────
   var cacheKey = path;
+
+  // Cache fresco — retorna imediatamente
   if (cache.has(cacheKey)) {
     return res.json(cache.get(cacheKey));
   }
+
   var target = 'https://api.mangadex.org' + path;
   try {
-    var upstream = await mdxGetApi(target);
+    var upstream = await mdxGet(target, path);
     cacheSet(cacheKey, upstream.data);
     res.json(upstream.data);
   } catch (err) {
     var status = (err.response && err.response.status) || 502;
+
+    // Se 429 e tem cache antigo — usa stale cache
+    if (status === 429 && staleCache.has(cacheKey)) {
+      console.warn('[PROXY] 429 — serving stale cache for:', path.split('?')[0]);
+      return res.json(staleCache.get(cacheKey));
+    }
+
     var body = (err.response && err.response.data) || { error: 'MangaDex proxy error' };
     console.error('[PROXY] ' + path.split('?')[0] + ' → ' + status);
     res.status(status).json(body);
